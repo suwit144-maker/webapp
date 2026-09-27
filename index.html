@@ -1,13 +1,219 @@
-<!DOCTYPE html>
-<html lang="th">
-<head>
-    <base target="_top">
-    <meta charset="UTF-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>เว็บแอป</title>
-</head>
-<body>
-    <iframe style="width: 100%; height: 100vh;" scrolling="yes" src="https://script.google.com/macros/s/AKfycbzeA6c3oIu2lf_pUhOu6rT75iZlSMN0yZxgLnCGN6BNb1tKUrkPsBOTX_NrBA_GFMJBNQ/exec" frameborder="0"></iframe>
-</body>
-</html>
+const SHEET_NAME_TX = 'Transactions';
+const SHEET_NAME_USERS = 'Users';
+const SHEET_NAME_CATS = 'Categories';
+
+function getSS() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function checkSheet(name, headers) {
+  var ss = getSS();
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headers);
+  }
+  return sheet;
+}
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('FinTrack Cloud')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function api(action, payload, token) {
+  try {
+    if (action === 'login') return handleLogin(payload);
+    if (action === 'register') return handleRegister(payload);
+
+    var user = verifyToken(token);
+    if (!user) throw new Error('กรุณาเข้าสู่ระบบก่อน');
+
+    switch (action) {
+      case 'bootstrap': return handleBootstrap(user);
+      case 'addTx': return handleAddTx(user, payload);
+      case 'updateTx': return handleUpdateTx(user, payload);
+      case 'deleteTx': return handleDeleteTx(user, payload);
+      case 'addCat': return handleAddCat(user, payload);
+      case 'deleteCat': return handleDeleteCat(user, payload);
+      case 'changePassword': return handleChangePassword(user, payload);
+      default: throw new Error('ไม่พบคำสั่ง: ' + action);
+    }
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function handleRegister(p) {
+  var userSheet = checkSheet(SHEET_NAME_USERS, ['id', 'username', 'password', 'displayName', 'created']);
+  var data = userSheet.getDataRange().getValues();
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][1] === p.username) throw new Error('ชื่อผู้ใช้นี้ถูกใช้งานแล้ว');
+  }
+
+  var userId = 'u_' + Date.now();
+  var hashedPassword = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, p.password);
+  var hashStr = hashedPassword.map(function(byte) { return (byte + 256).toString(16).slice(-2); }).join('');
+
+  userSheet.appendRow([userId, p.username, hashStr, p.displayName, new Date()]);
+
+  var catSheet = checkSheet(SHEET_NAME_CATS, ['userId', 'type', 'name']);
+  var defaultCats = [
+    [userId, 'income', 'เงินเดือน'], [userId, 'income', 'โบนัส'], [userId, 'income', 'รายรับอื่นๆ'],
+    [userId, 'expense', 'อาหาร'], [userId, 'expense', 'เดินทาง'], [userId, 'expense', 'ช้อปปิ้ง'], 
+    [userId, 'expense', 'ค่าน้ำ/ค่าไฟ'], [userId, 'expense', 'บันเทิง']
+  ];
+  for (var c = 0; c < defaultCats.length; c++) { catSheet.appendRow(defaultCats[c]); }
+
+  var token = createToken(userId);
+  return { ok: true, data: { token: token, user: { id: userId, displayName: p.displayName } } };
+}
+
+function handleLogin(p) {
+  var userSheet = checkSheet(SHEET_NAME_USERS, ['id', 'username', 'password', 'displayName', 'created']);
+  var data = userSheet.getDataRange().getValues();
+
+  var hashedPassword = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, p.password);
+  var hashStr = hashedPassword.map(function(byte) { return (byte + 256).toString(16).slice(-2); }).join('');
+
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][1] === p.username && data[i][2] === hashStr) {
+      var token = createToken(data[i][0]);
+      return { ok: true, data: { token: token, user: { id: data[i][0], displayName: data[i][3] } } };
+    }
+  }
+  throw new Error('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง');
+}
+
+function createToken(userId) {
+  var payload = { userId: userId, exp: Date.now() + (7 * 24 * 60 * 60 * 1000) };
+  return Utilities.base64EncodeWebSafe(JSON.stringify(payload));
+}
+
+function verifyToken(token) {
+  if (!token) return null;
+  try {
+    var raw = Utilities.newBlob(Utilities.base64DecodeWebSafe(token)).getDataAsString();
+    var payload = JSON.parse(raw);
+    if (payload.exp < Date.now()) return null;
+    
+    var userSheet = checkSheet(SHEET_NAME_USERS, ['id', 'username', 'password', 'displayName', 'created']);
+    var data = userSheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] === payload.userId) {
+        return { id: data[i][0], username: data[i][1], displayName: data[i][3] };
+      }
+    }
+  } catch (e) { return null; }
+  return null;
+}
+
+function handleBootstrap(user) {
+  var txSheet = checkSheet(SHEET_NAME_TX, ['id', 'userId', 'type', 'date', 'category', 'note', 'amount', 'createdAt', 'updatedAt']);
+  var txData = txSheet.getDataRange().getValues();
+  var txs = [];
+  for (var i = 1; i < txData.length; i++) {
+    if (txData[i][1] === user.id) {
+      txs.push({
+        id: txData[i][0], type: txData[i][2],
+        date: String(txData[i][3]).slice(0, 10),
+        category: txData[i][4], note: txData[i][5], amount: Number(txData[i][6])
+      });
+    }
+  }
+
+  var catSheet = checkSheet(SHEET_NAME_CATS, ['userId', 'type', 'name']);
+  var catData = catSheet.getDataRange().getValues();
+  var cats = { income: [], expense: [] };
+  for (var j = 1; j < catData.length; j++) {
+    if (catData[j][0] === user.id) {
+      if (catData[j][1] === 'income') cats.income.push(catData[j][2]);
+      if (catData[j][1] === 'expense') cats.expense.push(catData[j][2]);
+    }
+  }
+
+  return { ok: true, data: { user: user, tx: txs, cats: cats } };
+}
+
+function handleAddTx(user, p) {
+  var txSheet = checkSheet(SHEET_NAME_TX, ['id', 'userId', 'type', 'date', 'category', 'note', 'amount', 'createdAt', 'updatedAt']);
+  var id = 'tx_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+  var nowStr = new Date().toLocaleString();
+  txSheet.appendRow([id, user.id, p.type, p.date, p.category, p.note || '', Number(p.amount), nowStr, nowStr]);
+  return { ok: true, data: { id: id, type: p.type, date: p.date, category: p.category, note: p.note || '', amount: Number(p.amount) } };
+}
+
+function handleUpdateTx(user, p) {
+  var txSheet = checkSheet(SHEET_NAME_TX, ['id', 'userId', 'type', 'date', 'category', 'note', 'amount', 'createdAt', 'updatedAt']);
+  var data = txSheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === p.id && data[i][1] === user.id) {
+      var row = i + 1;
+      var nowStr = new Date().toLocaleString();
+      txSheet.getRange(row, 3).setValue(p.type);
+      txSheet.getRange(row, 4).setValue(p.date);
+      txSheet.getRange(row, 5).setValue(p.category);
+      txSheet.getRange(row, 6).setValue(p.note || '');
+      txSheet.getRange(row, 7).setValue(Number(p.amount));
+      txSheet.getRange(row, 9).setValue(nowStr);
+      return { ok: true, data: { id: p.id, type: p.type, date: p.date, category: p.category, note: p.note || '', amount: Number(p.amount) } };
+    }
+  }
+  throw new Error('ไม่พบรายการที่ต้องการแก้ไข');
+}
+
+function handleDeleteTx(user, p) {
+  var txSheet = checkSheet(SHEET_NAME_TX, ['id', 'userId', 'type', 'date', 'category', 'note', 'amount', 'createdAt', 'updatedAt']);
+  var data = txSheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === p.id && data[i][1] === user.id) {
+      txSheet.deleteRow(i + 1);
+      return { ok: true, data: { success: true } };
+    }
+  }
+  throw new Error('ไม่พบรายการที่ต้องการลบ');
+}
+
+function handleAddCat(user, p) {
+  var catSheet = checkSheet(SHEET_NAME_CATS, ['userId', 'type', 'name']);
+  var data = catSheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === user.id && data[i][1] === p.type && data[i][2] === p.name) {
+      throw new Error('มีหมวดหมู่นี้อยู่แล้ว');
+    }
+  }
+  catSheet.appendRow([user.id, p.type, p.name]);
+  return { ok: true, data: { type: p.type, name: p.name } };
+}
+
+function handleDeleteCat(user, p) {
+  var catSheet = checkSheet(SHEET_NAME_CATS, ['userId', 'type', 'name']);
+  var data = catSheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === user.id && data[i][1] === p.type && data[i][2] === p.name) {
+      catSheet.deleteRow(i + 1);
+      return { ok: true, data: { success: true } };
+    }
+  }
+  throw new Error('ไม่พบหมวดหมู่ที่ต้องการลบ');
+}
+
+function handleChangePassword(user, p) {
+  var userSheet = checkSheet(SHEET_NAME_USERS, ['id', 'username', 'password', 'displayName', 'created']);
+  var data = userSheet.getDataRange().getValues();
+  var oldHash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, p.oldPassword);
+  var oldHashStr = oldHash.map(function(b) { return (b + 256).toString(16).slice(-2); }).join('');
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === user.id) {
+      if (data[i][2] !== oldHashStr) throw new Error('รหัสผ่านเดิมไม่ถูกต้อง');
+      var newHash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, p.newPassword);
+      var newHashStr = newHash.map(function(b) { return (b + 256).toString(16).slice(-2); }).join('');
+      userSheet.getRange(i + 1, 3).setValue(newHashStr);
+      return { ok: true, data: { success: true } };
+    }
+  }
+  throw new Error('ไม่พบผู้ใช้งาน');
+}
